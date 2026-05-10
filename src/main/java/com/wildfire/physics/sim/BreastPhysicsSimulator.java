@@ -70,7 +70,7 @@ public final class BreastPhysicsSimulator {
         float breastWeight = appearance.bustSize() * BREAST_WEIGHT_PER_BUST;
         float bounceIntensity = computeBounceIntensity(effectiveBust, appearance, armor, random);
 
-        updateFallDirection(body);
+        updateFallDirection(body, random);
 
         targetY = body.motionDelta().y() * bounceIntensity + breastWeight;
         targetRot = -yawDelta(body) * bounceIntensity
@@ -117,9 +117,9 @@ public final class BreastPhysicsSimulator {
         return intensity;
     }
 
-    private void updateFallDirection(BodyState body) {
+    private void updateFallDirection(BodyState body, RandomSource random) {
         if (body.fallDistance() > 0f && !alreadyFalling) {
-            randomB = randomB > 0 ? -1 : 1; // will be overridden by adapter-supplied randomness if needed
+            randomB = random.nextBoolean() ? -1 : 1;
             alreadyFalling = true;
         }
         if (body.fallDistance() == 0f) {
