@@ -25,7 +25,7 @@ public final class BreastPhysicsSimulator {
     private static final float POSITION_Y_MAX             = 1.5f;
     private static final float BOUNCE_FLOOR               = -0.5f;
     private static final float BOUNCE_CEIL                = 2.5f;     // pushback engages above 2.5
-    private static final float BOUNCE_CEIL_REF            = 2.65f;    // distanceFromMax is computed against 2.65
+    private static final float BOUNCE_CEIL_REF            = 2.65f;    // distanceFromMax measured against 2.65
     private static final float Y_VELOCITY_GAIN            = 1.1625f;
 
     // X-axis spring state. The original code declared but never wrote a target for X, so this
@@ -35,7 +35,7 @@ public final class BreastPhysicsSimulator {
     private float positionY, prevPositionY;
     private float bounceVelY;        // integrated bounce position before final clamp
     private float velocityY;         // spring velocity
-    private float targetY;           // target bounce, refreshed each tick
+    private float targetY;
     // Rotation spring state.
     private float bounceRotation, prevBounceRotation;
     private float bounceRotVel;
@@ -43,6 +43,12 @@ public final class BreastPhysicsSimulator {
     private float targetRot;
     // Smoothed breast size (eases toward the target derived from appearance + armor).
     private float breastSize, prevBreastSize;
+    // Per-entity persistent flags carried between ticks.
+    private PoseKind lastPose;
+    private boolean alreadyFalling;
+    private int randomB = 1;
+    private int lastSwingTick;
+    private int lastSwingDuration = 6;
 
     public void freezeStatic(AppearanceConfig appearance, ArmorEffect armor) {
         prevBreastSize = breastSize = effectiveBustSize(appearance, armor);
@@ -54,17 +60,26 @@ public final class BreastPhysicsSimulator {
         AppearanceConfig appearance = input.appearance();
         ArmorEffect armor = input.armor();
         BodyState body = input.body();
+        SwingState swing = input.swing();
+        VehicleContribution vehicle = input.vehicle();
+        RandomSource random = input.random();
 
         float effectiveBust = effectiveBustSize(appearance, armor);
         breastSize = (breastSize + effectiveBust) * 0.5f;
 
         float breastWeight = appearance.bustSize() * BREAST_WEIGHT_PER_BUST;
-        float bounceIntensity = computeBounceIntensity(effectiveBust, appearance, armor, input.random());
+        float bounceIntensity = computeBounceIntensity(effectiveBust, appearance, armor, random);
+
+        updateFallDirection(body);
 
         targetY = body.motionDelta().y() * bounceIntensity + breastWeight;
-        targetY += walkAnimContribution(body);
+        targetRot = -yawDelta(body) * bounceIntensity
+                + body.motionDelta().y() * bounceIntensity * randomB;
 
-        targetRot = -yawDelta(body) * bounceIntensity;
+        targetY += walkAnimContribution(body);
+        applyPoseTransition(input.pose(), bounceIntensity);
+        applyVehicleContribution(vehicle, bounceIntensity, breastWeight);
+        applySwingForces(swing, input.pose(), bounceIntensity, random);
 
         applyBoundaryPushback();
         clampTargets();
@@ -102,6 +117,16 @@ public final class BreastPhysicsSimulator {
         return intensity;
     }
 
+    private void updateFallDirection(BodyState body) {
+        if (body.fallDistance() > 0f && !alreadyFalling) {
+            randomB = randomB > 0 ? -1 : 1; // will be overridden by adapter-supplied randomness if needed
+            alreadyFalling = true;
+        }
+        if (body.fallDistance() == 0f) {
+            alreadyFalling = false;
+        }
+    }
+
     private static float walkAnimContribution(BodyState body) {
         float f = body.velocity().lengthSquared() / 0.2f;
         f = Math.max(f * f * f, 1f);
@@ -111,6 +136,83 @@ public final class BreastPhysicsSimulator {
 
     private static float yawDelta(BodyState body) {
         return (body.effectiveBodyYaw() - body.prevEffectiveBodyYaw()) / 15f;
+    }
+
+    private void applyPoseTransition(PoseKind pose, float bounceIntensity) {
+        if (pose == lastPose) {
+            return;
+        }
+        if (pose == PoseKind.CROUCHING || lastPose == PoseKind.CROUCHING) {
+            targetY += bounceIntensity;
+        } else if (pose == PoseKind.SLEEPING || lastPose == PoseKind.SLEEPING) {
+            targetY = bounceIntensity;
+        }
+        lastPose = pose;
+    }
+
+    private void applyVehicleContribution(VehicleContribution vehicle, float bounceIntensity, float breastWeight) {
+        switch (vehicle.mode()) {
+            case NONE -> { /* no-op */ }
+            case REPLACE -> targetY = vehicle.intensityFactor() * bounceIntensity
+                    + vehicle.weightFactor() * breastWeight;
+            case ADD -> targetY += vehicle.intensityFactor() * bounceIntensity
+                    + vehicle.weightFactor() * breastWeight;
+        }
+    }
+
+    /**
+     * Translates swing animation state into bounce + rotation contributions.
+     * Mirrors the original logic: swings of duration > 1 produce per-Nth-tick bounces and
+     * rotation in the direction the body is rotating toward; interrupted swings produce
+     * counter-rotation. Sleeping suppresses everything.
+     */
+    private void applySwingForces(SwingState swing, PoseKind pose, float bounceIntensity, RandomSource random) {
+        int swingDuration = swing.swingDuration();
+        boolean active = (swingDuration > 1 || lastSwingDuration > 1) && pose != PoseKind.SLEEPING;
+
+        if (active) {
+            float amplifier = swingAmplifier(swingDuration);
+            int everyNthTick = (int) clamp(swingDuration - 1, 1, 5);
+
+            if (swing.swinging() && swing.tickCount() % everyNthTick == 0) {
+                float hasteMult = clamp(everyNthTick / 5f, 0.4f, 1f);
+                float sign = random.nextBoolean() ? 0.25f : -0.25f;
+                targetY += sign * amplifier * bounceIntensity * hasteMult;
+            }
+
+            int swingTickDelta = swing.swingTime() - lastSwingTick;
+            float swingProgress = distanceFromMedian(0, lastSwingDuration,
+                    (int) clamp(lastSwingTick, 0, lastSwingDuration));
+            Arm swingingArm = swing.swingingArm();
+
+            if (swingTickDelta < 0 && lastSwingTick != lastSwingDuration - 1) {
+                // interrupted swing: counter-rotate toward the still-swinging arm
+                float dir = swingingArm == Arm.RIGHT ? -2.5f : 2.5f;
+                targetRot += dir * Math.abs(swingProgress) * bounceIntensity;
+            } else if (swing.swinging() && swingDuration > 1) {
+                // continuing swing: rotate slightly counter to current body motion
+                Arm swingingToward = swingProgress > 0f ? swingingArm.opposite() : swingingArm;
+                float dir = swingingToward == Arm.RIGHT ? -0.2f : 0.2f;
+                targetRot += dir * amplifier * bounceIntensity;
+            }
+            lastSwingTick = swing.swingTime();
+        }
+        if (!swing.swinging()) {
+            lastSwingTick = 0;
+        }
+        lastSwingDuration = Math.max(swingDuration, 1);
+    }
+
+    private static float swingAmplifier(int swingDuration) {
+        float a;
+        if (swingDuration < 6) {
+            a = 0.15f * (6 - swingDuration);
+        } else if (swingDuration > 6) {
+            a = -0.067f * (swingDuration - 6);
+        } else {
+            a = 0f;
+        }
+        return clamp(1f + a, 0.6f, 1.3f);
     }
 
     private void applyBoundaryPushback() {
@@ -163,6 +265,29 @@ public final class BreastPhysicsSimulator {
             size *= 1f - ARMOR_TIGHTNESS_BUST_SHRINK * clamp01(armor.tightness());
         }
         return size;
+    }
+
+    /**
+     * Distance from the median of {@code [p1, p2]} to {@code point}, normalized to {@code [-1, 1]}.
+     * Returns 1 at the median, 0 at either boundary, negative in the upper half of the range.
+     * Preserved from the original implementation.
+     */
+    static float distanceFromMedian(int p1, int p2, float point) {
+        if (p1 >= p2) {
+            throw new IllegalArgumentException("p2 must be greater than p1");
+        }
+        if (point < p1 || point > p2) {
+            throw new IllegalArgumentException(point + " not in (" + p1 + ", " + p2 + ")");
+        }
+        if (point == p1 || point == p2) {
+            return 0f;
+        }
+        float median = (p2 - p1) / 2f;
+        point -= p1;
+        if (point > median) {
+            point = -(median - (point - median));
+        }
+        return point / median;
     }
 
     static float clamp01(float v) {
